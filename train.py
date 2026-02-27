@@ -355,8 +355,9 @@ def train():
     ]
     print(f"   Маскируемые токены (не участвуют в loss): {config.ignore_token_ids}")
 
-    # Gradient checkpointing — включай если не хватает VRAM
-    # config.use_gradient_checkpointing = True  # раскомментируй при OOM
+    # Gradient checkpointing — пересчитываем активации при backward вместо хранения
+    # Экономит ~60% VRAM ценой ~30% скорости. Для 1B модели — рекомендуется.
+    config.use_gradient_checkpointing = True
 
     train_dataset = MemmapDataset(str(train_bin), config.block_size)
     val_dataset = MemmapDataset(str(val_bin), config.block_size)
@@ -371,14 +372,24 @@ def train():
     model = MiniGPT(config).to(device)
 
     # Компилируем модель (PyTorch 2.0+) — ускорение ~20-30%
-    # ВАЖНО: torch.compile может конфликтовать с Transformer Engine,
-    # поэтому отключаем при FP8/FP4 (TE сам оптимизирует ядра через CUDA graphs)
+    # ВАЖНО:
+    # - torch.compile конфликтует с Transformer Engine → отключаем при FP8/FP4
+    # - torch.compile может вызвать segfault/OOM на Blackwell (RTX 50xx) →
+    #   включаем только если COMPILE=1 задан явно
+    # По умолчанию: ВЫКЛЮЧЕН. Для включения: COMPILE=1 python train.py
     use_te_mode = PRECISION_MODE in ("fp8", "fp4") and TE_AVAILABLE and device.type == "cuda"
-    if hasattr(torch, 'compile') and device.type == "cuda" and not use_te_mode:
-        print("🔧 Компилирую модель (torch.compile)...")
-        model = torch.compile(model)
-    elif use_te_mode:
+    enable_compile = os.environ.get("COMPILE", "0") == "1"
+    if use_te_mode:
         print("🔧 torch.compile отключён (Transformer Engine использует свои CUDA ядра)")
+    elif enable_compile and hasattr(torch, 'compile') and device.type == "cuda":
+        print("🔧 Компилирую модель (torch.compile)...")
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"⚠️  torch.compile не удался: {e}")
+            print("   Продолжаю без компиляции")
+    else:
+        print("🔧 torch.compile отключён (для включения: COMPILE=1)")
 
     # --- Оптимизатор ---
     # Разделяем параметры: weight decay применяем только к матрицам весов,
