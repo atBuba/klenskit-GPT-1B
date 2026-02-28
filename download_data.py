@@ -4,15 +4,20 @@
 Датасет: Russian Wikipedia (полный текст, очищенный)
 Источник: https://huggingface.co/datasets/atBuba/ruwiki-dataset
 
-Формат: один .txt файл (~7.9 GB), статьи разделены <|endoftext|>
+Два режима:
+1. python download_data.py --tokenized   ← РЕКОМЕНДУЕТСЯ
+   Скачивает готовые train.bin + val.bin (~2.3 GB)
+   Можно сразу начинать обучение — токенизация не нужна!
 
-Использование:
-    python download_data.py              # скачать датасет
-    python download_data.py --check      # проверить что датасет на месте
+2. python download_data.py --raw
+   Скачивает сырой ruwiki_full.txt (~7.9 GB)
+   После этого нужна токенизация: python dataset.py
 
-После скачивания запусти токенизацию:
-    python dataset.py                    # полный датасет
-    python dataset.py --test             # тестовый (~10M токенов)
+3. python download_data.py --all
+   Скачивает всё (и .txt, и .bin)
+
+4. python download_data.py --check
+   Проверяет что данные на месте
 """
 
 import os
@@ -22,157 +27,186 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent
 DATA_DIR = REPO_ROOT / "data"
 CORPUS_FILE = DATA_DIR / "ruwiki_full.txt"
+TRAIN_BIN = DATA_DIR / "train.bin"
+VAL_BIN = DATA_DIR / "val.bin"
 
 HF_DATASET_REPO = "atBuba/ruwiki-dataset"
 
 
-def check_dataset():
-    """Проверяет наличие датасета."""
-    if CORPUS_FILE.exists():
-        size_gb = CORPUS_FILE.stat().st_size / 1024**3
-        print(f"✅ Датасет найден: {CORPUS_FILE}")
-        print(f"   Размер: {size_gb:.2f} GB")
-        return True
-    else:
-        print(f"❌ Датасет не найден: {CORPUS_FILE}")
-        print(f"   Запусти: python download_data.py")
-        return False
-
-
-def download_dataset():
-    """
-    Скачивает датасет с HuggingFace.
-
-    Использует huggingface_hub для скачивания файлов из репозитория.
-    Датасет хранится как .txt файл — скачиваем его напрямую в data/.
-    """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    if CORPUS_FILE.exists():
-        size_gb = CORPUS_FILE.stat().st_size / 1024**3
-        print(f"✅ Датасет уже скачан: {CORPUS_FILE} ({size_gb:.2f} GB)")
-        print(f"\n   Следующий шаг — токенизация:")
-        print(f"   python dataset.py            # полный датасет")
-        print(f"   python dataset.py --test     # тестовый (~10M токенов)")
-        return
-
-    # Проверяем наличие huggingface_hub
+def _get_hf():
+    """Импортирует huggingface_hub, ставит если нет."""
     try:
         from huggingface_hub import HfApi, hf_hub_download
+        return HfApi, hf_hub_download
     except ImportError:
         print("❌ Библиотека huggingface_hub не установлена!")
         print("   Установи: pip install huggingface_hub")
         sys.exit(1)
 
-    print(f"📥 Скачиваю датасет с HuggingFace...")
-    print(f"   Репозиторий: https://huggingface.co/datasets/{HF_DATASET_REPO}")
-    print(f"   Это может занять время (~8 GB)...\n")
 
-    # Получаем список файлов в репозитории
+def check_dataset():
+    """Проверяет наличие данных."""
+    has_bins = TRAIN_BIN.exists() and VAL_BIN.exists()
+    has_txt = CORPUS_FILE.exists()
+
+    if has_bins:
+        train_gb = TRAIN_BIN.stat().st_size / 1024**3
+        val_mb = VAL_BIN.stat().st_size / 1024**2
+        print(f"✅ Токенизированные данные найдены:")
+        print(f"   train.bin: {train_gb:.2f} GB")
+        print(f"   val.bin:   {val_mb:.1f} MB")
+        print(f"\n   Готово к обучению: python train.py")
+
+    if has_txt:
+        txt_gb = CORPUS_FILE.stat().st_size / 1024**3
+        print(f"✅ Сырой корпус найден: ruwiki_full.txt ({txt_gb:.2f} GB)")
+
+    if not has_bins and not has_txt:
+        print("❌ Данные не найдены!")
+        print("   python download_data.py --tokenized   # скачать готовые .bin (рекомендуется)")
+        print("   python download_data.py --raw         # скачать сырой .txt")
+        return False
+
+    return True
+
+
+def _download_file(filename: str):
+    """Скачивает один файл из HF репозитория в data/."""
+    _, hf_hub_download = _get_hf()
+    print(f"   ⬇️  {filename}...")
+    downloaded = hf_hub_download(
+        repo_id=HF_DATASET_REPO,
+        filename=filename,
+        repo_type="dataset",
+        local_dir=str(DATA_DIR),
+    )
+    downloaded_path = Path(downloaded)
+    target = DATA_DIR / filename
+
+    # hf_hub_download может сохранить в подпапку — перемещаем
+    if downloaded_path != target and downloaded_path.exists():
+        downloaded_path.rename(target)
+
+    size_mb = target.stat().st_size / 1024**2
+    print(f"      ✅ {filename} ({size_mb:.1f} MB)")
+    return target
+
+
+def download_tokenized():
+    """
+    Скачивает готовые токенизированные файлы (train.bin + val.bin).
+    После этого можно сразу запускать обучение — токенизация не нужна.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if TRAIN_BIN.exists() and VAL_BIN.exists():
+        train_gb = TRAIN_BIN.stat().st_size / 1024**3
+        print(f"✅ Токенизированные данные уже скачаны:")
+        print(f"   train.bin: {train_gb:.2f} GB")
+        print(f"\n   Готово к обучению: python train.py")
+        return
+
+    HfApi, _ = _get_hf()
     api = HfApi()
+
+    # Проверяем что файлы есть в репозитории
     try:
         files = api.list_repo_files(HF_DATASET_REPO, repo_type="dataset")
     except Exception as e:
         print(f"❌ Ошибка при доступе к репозиторию: {e}")
-        print(f"   Проверь ссылку: https://huggingface.co/datasets/{HF_DATASET_REPO}")
         sys.exit(1)
 
-    # Ищем .txt файл
-    txt_files = [f for f in files if f.endswith(".txt")]
+    if "train.bin" not in files or "val.bin" not in files:
+        print("⚠️  Токенизированные файлы (train.bin, val.bin) не найдены в репозитории!")
+        print(f"   Доступные файлы: {[f for f in files if not f.startswith('.')]}")
+        print(f"\n   Скачай сырой корпус и токенизируй:")
+        print(f"   python download_data.py --raw")
+        print(f"   python dataset.py")
+        return
 
-    if not txt_files:
-        # Может быть файл в подпапке или другом формате — показываем что есть
-        print(f"   Файлы в репозитории: {files}")
-        print(f"\n⚠️  .txt файл не найден. Скачиваю все доступные файлы...")
+    print(f"📥 Скачиваю токенизированные данные с HuggingFace...")
+    print(f"   Репозиторий: https://huggingface.co/datasets/{HF_DATASET_REPO}\n")
 
-        # Скачиваем всё и ищем текст
-        for fname in files:
-            if fname.startswith(".") or fname in ("README.md", ".gitattributes"):
-                continue
-            print(f"   Скачиваю: {fname}")
-            downloaded = hf_hub_download(
-                repo_id=HF_DATASET_REPO,
-                filename=fname,
-                repo_type="dataset",
-                local_dir=str(DATA_DIR),
-            )
-            print(f"   → {downloaded}")
+    _download_file("train.bin")
+    _download_file("val.bin")
 
-        # Проверяем, появился ли нужный файл
-        _find_and_rename_corpus()
-    else:
-        # Скачиваем .txt файл напрямую
-        target_file = txt_files[0]
-        print(f"   Найден: {target_file}")
-        print(f"   Скачиваю...\n")
+    train_gb = TRAIN_BIN.stat().st_size / 1024**3
+    print(f"\n✅ Готово! Скачано {train_gb:.2f} GB токенизированных данных.")
+    print(f"   Токенизация НЕ НУЖНА — можно сразу обучать:")
+    print(f"   python train.py --test    # тестовый прогон")
+    print(f"   python train.py           # полное обучение")
 
-        downloaded = hf_hub_download(
-            repo_id=HF_DATASET_REPO,
-            filename=target_file,
-            repo_type="dataset",
-            local_dir=str(DATA_DIR),
-        )
 
-        downloaded_path = Path(downloaded)
+def download_raw():
+    """Скачивает сырой текстовый корпус (ruwiki_full.txt)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Переименовываем в ruwiki_full.txt если нужно
-        if downloaded_path != CORPUS_FILE:
-            if downloaded_path.exists():
-                # hf_hub_download может сохранить в подпапку
-                downloaded_path.rename(CORPUS_FILE)
-                print(f"   Переименовано: {downloaded_path.name} → ruwiki_full.txt")
-            else:
-                # Файл мог быть сохранён по другому пути
-                _find_and_rename_corpus()
-
-    # Финальная проверка
     if CORPUS_FILE.exists():
         size_gb = CORPUS_FILE.stat().st_size / 1024**3
-        print(f"\n✅ Датасет скачан: {CORPUS_FILE}")
-        print(f"   Размер: {size_gb:.2f} GB")
+        print(f"✅ Корпус уже скачан: ruwiki_full.txt ({size_gb:.2f} GB)")
+        return
+
+    HfApi, _ = _get_hf()
+    api = HfApi()
+
+    try:
+        files = api.list_repo_files(HF_DATASET_REPO, repo_type="dataset")
+    except Exception as e:
+        print(f"❌ Ошибка при доступе к репозиторию: {e}")
+        sys.exit(1)
+
+    print(f"📥 Скачиваю сырой корпус с HuggingFace...")
+    print(f"   Репозиторий: https://huggingface.co/datasets/{HF_DATASET_REPO}\n")
+
+    # Ищем .txt файл
+    txt_files = [f for f in files if f.endswith(".txt") and f != "README.md"]
+
+    if txt_files:
+        target_file = txt_files[0]
+        _download_file(target_file)
+
+        # Переименовываем если имя отличается
+        downloaded = DATA_DIR / target_file
+        if downloaded.exists() and downloaded != CORPUS_FILE:
+            downloaded.rename(CORPUS_FILE)
+    else:
+        print(f"⚠️  .txt файл не найден в репозитории!")
+        print(f"   Доступные файлы: {[f for f in files if not f.startswith('.')]}")
+        return
+
+    if CORPUS_FILE.exists():
+        size_gb = CORPUS_FILE.stat().st_size / 1024**3
+        print(f"\n✅ Корпус скачан: ruwiki_full.txt ({size_gb:.2f} GB)")
         print(f"\n   Следующий шаг — токенизация:")
         print(f"   python dataset.py            # полный датасет")
         print(f"   python dataset.py --test     # тестовый (~10M токенов)")
-    else:
-        print(f"\n⚠️  Файл {CORPUS_FILE} не найден после скачивания.")
-        print(f"   Проверь содержимое папки: {DATA_DIR}")
-        _list_data_dir()
-
-
-def _find_and_rename_corpus():
-    """Ищет скачанный .txt файл и переименовывает в ruwiki_full.txt."""
-    for f in DATA_DIR.rglob("*.txt"):
-        if f.name == "ruwiki_full.txt":
-            continue
-        size_mb = f.stat().st_size / 1024**2
-        if size_mb > 100:  # > 100MB — скорее всего это наш датасет
-            print(f"   Найден текстовый файл: {f} ({size_mb:.0f} MB)")
-            # Перемещаем в корень data/
-            f.rename(CORPUS_FILE)
-            print(f"   Переименовано → {CORPUS_FILE}")
-            return True
-    return False
-
-
-def _list_data_dir():
-    """Выводит содержимое data/ для дебага."""
-    print(f"\n   Содержимое {DATA_DIR}:")
-    if DATA_DIR.exists():
-        for f in sorted(DATA_DIR.rglob("*")):
-            if f.is_file():
-                size_mb = f.stat().st_size / 1024**2
-                rel = f.relative_to(DATA_DIR)
-                print(f"     {rel} ({size_mb:.1f} MB)")
-    else:
-        print(f"     (папка не существует)")
 
 
 if __name__ == "__main__":
-    if "--check" in sys.argv:
+    args = sys.argv[1:]
+
+    if "--check" in args:
         check_dataset()
+    elif "--tokenized" in args:
+        download_tokenized()
+    elif "--raw" in args:
+        download_raw()
+    elif "--all" in args:
+        download_tokenized()
+        print()
+        download_raw()
     else:
         print("=" * 60)
         print("📥 Скачивание датасета для klenskiy-GPT-1B")
         print(f"   Источник: https://huggingface.co/datasets/{HF_DATASET_REPO}")
-        print("=" * 60 + "\n")
-        download_dataset()
+        print("=" * 60)
+        print()
+        print("Использование:")
+        print("  python download_data.py --tokenized   # готовые .bin (рекомендуется)")
+        print("  python download_data.py --raw         # сырой .txt (~8 GB)")
+        print("  python download_data.py --all         # всё")
+        print("  python download_data.py --check       # проверить данные")
+        print()
+        print("Рекомендуемый путь (без токенизации):")
+        print("  python download_data.py --tokenized")
+        print("  python train.py --test")

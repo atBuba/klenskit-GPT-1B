@@ -38,6 +38,18 @@ if TE_AVAILABLE:
     from transformer_engine.common import recipe as te_recipe
 
 # ============================================================
+# CUDA ОПТИМИЗАЦИИ (Blackwell / Hopper / Ampere)
+# ============================================================
+# TF32: использует Tensor Cores для float32 операций (~2x быстрее, точность ~FP16)
+# На Blackwell RTX 5090 это БЕСПЛАТНОЕ ускорение для всех float32 вычислений.
+# cudnn.benchmark: автоматически выбирает лучший CUDA алгоритм для convolutions.
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True   # TF32 для матричных умножений
+    torch.backends.cudnn.allow_tf32 = True          # TF32 для cuDNN операций
+    torch.backends.cudnn.benchmark = True            # Авто-тюнинг cuDNN ядер
+    torch.set_float32_matmul_precision('high')       # Предпочитать TF32 везде
+
+# ============================================================
 # КОНФИГУРАЦИЯ ОБУЧЕНИЯ
 # ============================================================
 
@@ -88,13 +100,49 @@ USE_WANDB = False
 WANDB_PROJECT = "klenskiy-gpt-1b"
 
 # --- Precision Mode (Blackwell optimization) ---
+# "auto"  — автоматически определяет лучший режим по GPU (рекомендуется!)
 # "bf16"  — стандарт (работает везде: Ampere, Hopper, Blackwell, MPS)
 # "fp8"   — MXFP8 через Transformer Engine (Hopper H100+, Blackwell) — ~2x ускорение
-# "fp4"   — NVFP4 через Transformer Engine (ТОЛЬКО Blackwell B200/B100) — ~4x ускорение
+# "fp4"   — NVFP4 через Transformer Engine (Blackwell RTX 5090 / B200) — до ~3x ускорение
 #
-# Для Blackwell рекомендуется "fp4" — аппаратно оптимизирован (10-15 petaFLOPS NVFP4)
-# Для Hopper используй "fp8"
-PRECISION_MODE = "fp4"
+# Для RTX 5090 (Blackwell consumer): "fp4" если TE >= 2.7, иначе "fp8"
+# Для H100 (Hopper): "fp8"
+# Для RTX 4090 (Ada): "bf16"
+PRECISION_MODE = "auto"
+
+
+def detect_precision_mode():
+    """
+    Автоматически определяет лучший precision mode по GPU.
+
+    Blackwell (SM 12.0 = major 12, RTX 5090 / B200): FP4 если TE поддерживает, иначе FP8
+    Hopper (SM 9.0 = major 9, H100): FP8
+    Ada Lovelace (SM 8.9 = major 8 minor 9, RTX 4090): bf16
+    Ampere (SM 8.0-8.6, A100/RTX 3090): bf16
+    Остальные: bf16
+    """
+    if not torch.cuda.is_available() or not TE_AVAILABLE:
+        return "bf16"
+
+    # Compute capability: major.minor (например, 12.0 для Blackwell, 9.0 для Hopper)
+    major, minor = torch.cuda.get_device_capability()
+
+    if major >= 12:
+        # Blackwell (RTX 5090 = SM 12.0, B200 = SM 12.0)
+        if hasattr(te_recipe, 'NVFP4BlockScaling'):
+            print(f"🔍 GPU SM {major}.{minor} (Blackwell) + TE с NVFP4 → режим FP4")
+            return "fp4"
+        else:
+            print(f"🔍 GPU SM {major}.{minor} (Blackwell) но TE без NVFP4 → режим FP8")
+            return "fp8"
+    elif major >= 9:
+        # Hopper (H100 = SM 9.0) — FP8 нативно поддерживается
+        print(f"🔍 GPU SM {major}.{minor} (Hopper) → режим FP8")
+        return "fp8"
+    else:
+        # Ampere (SM 8.0), Ada Lovelace (SM 8.9), и старше
+        print(f"🔍 GPU SM {major}.{minor} → режим bf16")
+        return "bf16"
 
 # --- Тестовый режим (--test) ---
 # Переопределяется ниже если запустить: python train.py --test
@@ -146,8 +194,10 @@ def apply_test_config():
     SAMPLE_INTERVAL = 100      # Генерация каждые 100 шагов
     LOG_INTERVAL = 10          # Логируем каждые 10 шагов
 
-    # bf16 для теста (fp4/fp8 требуют спец. железо)
+    # bf16 для теста (fp4/fp8 требуют спец. железо и могут быть нестабильны при коротких прогонах)
     PRECISION_MODE = "bf16"
+
+    print("🧪 Тестовый режим: precision принудительно bf16")
 
 
 # ============================================================
@@ -248,6 +298,11 @@ def setup():
 
     # ── Transformer Engine контекст (FP8/FP4 поверх bf16) ──
     te_ctx_fn = None  # функция, создающая контекст (вызываем каждый шаг)
+
+    # Авто-определение precision mode если задан "auto"
+    global PRECISION_MODE
+    if PRECISION_MODE == "auto":
+        PRECISION_MODE = detect_precision_mode()
 
     if PRECISION_MODE in ("fp8", "fp4") and TE_AVAILABLE and device.type == "cuda":
         if PRECISION_MODE == "fp8":
@@ -497,8 +552,13 @@ def train():
                     logits, loss = model(x, y)
                 loss = loss / GRADIENT_ACCUM_STEPS  # нормализуем по кол-ву шагов
 
+            # backward — на Blackwell GDDR7 (1.79 TB/s) gradient sync быстрый,
+            # но всё равно лучше не создавать лишних аллокаций
             scaler.scale(loss).backward()
             accum_loss += loss.item()
+
+            # Освобождаем ссылки на промежуточные тензоры между micro-steps
+            del logits, loss
 
         # --- Gradient Clipping ---
         # Ограничиваем норму градиента. Без этого при 1B параметрах

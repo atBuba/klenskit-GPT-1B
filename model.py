@@ -157,10 +157,10 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         # x.shape = (B, T, dim)
-        # 1. Считаем RMS (root mean square) по последнему измерению
-        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        # 2. Нормализуем и масштабируем
-        return x / rms * self.weight
+        # rsqrt = 1/sqrt — одна fused операция вместо sqrt + div (быстрее на Tensor Cores)
+        # .float() → считаем в FP32 для численной стабильности (как в Llama reference)
+        norm = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * norm).to(x.dtype) * self.weight
 
 
 # ============================================================
@@ -285,11 +285,11 @@ class GroupedQueryAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # Каузальная маска (с учётом возможного NTK scaling)
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(config.max_seq_len, config.max_seq_len))
-        )
+        # Каузальная маска для fallback (PyTorch < 2.0)
+        # SDPA с is_causal=True НЕ использует этот буфер — он нужен только для fallback.
+        # Для max_seq_len=2048: буфер = 2048²×4 bytes = 16MB. Лениво создаём только при fallback.
+        self._mask = None
+        self._max_seq_len = config.max_seq_len
 
         # Предвычисляем RoPE частоты (с учётом NTK scaling для длинных контекстов)
         rope_cos, rope_sin = precompute_rope_frequencies(
@@ -316,9 +316,13 @@ class GroupedQueryAttention(nn.Module):
         k = apply_rope(k, self.rope_cos, self.rope_sin)
 
         # Повторяем K и V для каждой группы Q-голов
-        # (B, 4, T, 16) → (B, 12, T, 16)
-        k = k.repeat_interleave(self.n_rep, dim=1)
-        v = v.repeat_interleave(self.n_rep, dim=1)
+        # (B, 4, T, 128) → (B, 16, T, 128)
+        # expand + reshape вместо repeat_interleave:
+        # expand создаёт VIEW без копирования данных (O(1) память),
+        # repeat_interleave создаёт физическую копию (O(n) память).
+        # На Blackwell (1.79 TB/s bandwidth) это критично — меньше данных перемещать.
+        k = k[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, T, self.head_dim).reshape(B, self.n_head, T, self.head_dim)
+        v = v[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, T, self.head_dim).reshape(B, self.n_head, T, self.head_dim)
 
         # Scaled Dot-Product Attention
         # PyTorch 2.0+ F.scaled_dot_product_attention автоматически использует
@@ -333,11 +337,13 @@ class GroupedQueryAttention(nn.Module):
             )
         else:
             # Fallback для PyTorch < 2.0
+            if self._mask is None or self._mask.size(0) < T:
+                self._mask = torch.tril(torch.ones(self._max_seq_len, self._max_seq_len, device=x.device))
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores.masked_fill(self.mask[:T, :T] == 0, float('-inf'))
+            scores = scores.masked_fill(self._mask[:T, :T] == 0, float('-inf'))
             weights = F.softmax(scores, dim=-1)
             weights = self.attn_dropout(weights)
-            out = weights @ v  # (B, 12, T, 16)
+            out = weights @ v  # (B, n_head, T, head_dim)
 
         # Собираем головы обратно
         out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, 192)
@@ -473,6 +479,11 @@ class MiniGPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+        elif TE_AVAILABLE and isinstance(module, te.Linear):
+            # te.Linear — НЕ подкласс nn.Linear, инициализируем отдельно
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -480,10 +491,12 @@ class MiniGPT(nn.Module):
         """Применяет scaled init к residual-проекциям после основной инициализации."""
         scale = 1.0 / math.sqrt(2.0 * self.config.n_layer)
         for block in self.blocks:
-            # Выходная проекция attention
-            torch.nn.init.normal_(block.attention.wo.weight, mean=0.0, std=0.02 * scale)
+            # Выходная проекция attention (nn.Linear или te.Linear — оба имеют .weight)
+            if hasattr(block.attention.wo, 'weight'):
+                torch.nn.init.normal_(block.attention.wo.weight, mean=0.0, std=0.02 * scale)
             # Выходная проекция FFN
-            torch.nn.init.normal_(block.feed_forward.w_down.weight, mean=0.0, std=0.02 * scale)
+            if hasattr(block.feed_forward.w_down, 'weight'):
+                torch.nn.init.normal_(block.feed_forward.w_down.weight, mean=0.0, std=0.02 * scale)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -511,6 +524,11 @@ class MiniGPT(nn.Module):
         # 5. Loss с маскированием спецтокенов
         # Спецтокены (pad, endoftext, sep, mask) не несут языковой информации —
         # нет смысла учить модель их предсказывать. Маскируем их из loss.
+        #
+        # ОПТИМИЗАЦИЯ: используем ignore_index=-100 вместо boolean indexing.
+        # Boolean indexing (flat_logits[mask]) создаёт копии тензоров и ломает
+        # torch.compile (динамические формы). ignore_index работает in-place
+        # внутри CUDA ядра cross_entropy — быстрее и совместимо с компиляцией.
         loss = None
         if targets is not None:
             B, T, C = logits.shape
@@ -518,16 +536,12 @@ class MiniGPT(nn.Module):
             flat_targets = targets.view(B * T)
 
             if self.config.ignore_token_ids:
-                # Создаём маску: True для токенов, которые УЧИТЫВАЕМ в loss
-                mask = torch.ones_like(flat_targets, dtype=torch.bool)
+                # Заменяем спецтокены на -100 (стандартный ignore_index PyTorch)
+                # clone() нужен чтобы не менять оригинальные targets
+                masked_targets = flat_targets.clone()
                 for tid in self.config.ignore_token_ids:
-                    mask &= (flat_targets != tid)
-
-                if mask.any():
-                    loss = F.cross_entropy(flat_logits[mask], flat_targets[mask])
-                else:
-                    # Весь батч — спецтокены (маловероятно, но на всякий случай)
-                    loss = F.cross_entropy(flat_logits, flat_targets)
+                    masked_targets[masked_targets == tid] = -100
+                loss = F.cross_entropy(flat_logits, masked_targets, ignore_index=-100)
             else:
                 loss = F.cross_entropy(flat_logits, flat_targets)
 

@@ -327,15 +327,7 @@ if __name__ == "__main__":
         tok = args[1] if len(args) >= 2 else None
         prepare_test_dataset(corpus, tok, target_tokens=target)
 
-    elif len(args) >= 2:
-        prepare_dataset(args[0], args[1])
     else:
-        print("Использование:")
-        print("  python dataset.py                          # полный датасет")
-        print("  python dataset.py [corpus.txt] [tok.model] # с кастомными путями")
-        print("  python dataset.py --test                   # тестовый (~10M токенов)")
-        print("  python dataset.py --test --tokens 5M       # тестовый (~5M токенов)")
-        print("  python dataset.py --test --tokens 1M       # тестовый (~1M токенов)")
-        print(f"\n   Корпус по умолчанию: {DEFAULT_CORPUS}")
-        print()
-        prepare_dataset()
+        corpus = args[0] if len(args) >= 1 else None
+        tok = args[1] if len(args) >= 2 else None
+        prepare_dataset(corpus, tok)
