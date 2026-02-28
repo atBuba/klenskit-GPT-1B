@@ -60,10 +60,12 @@ TOKENIZER_PATH = REPO_ROOT / "tokenizer" / "tokenizer.model"
 
 # --- Обучение ---
 MAX_STEPS = 100_000       # Общее кол-во шагов (для 5GB данных и batch ~0.5M токенов — ~1-2 эпохи)
-BATCH_SIZE = 8             # Микро-батч (сколько примеров за один forward pass)
-GRADIENT_ACCUM_STEPS = 16  # Кол-во микро-батчей перед обновлением весов
+BATCH_SIZE = 4             # Микро-батч (сколько примеров за один forward pass)
+                           # ⚠️  При FP8 без gradient checkpointing batch=8 вызывает OOM на 32GB
+                           #     batch=4 помещается. Компенсируем через GRADIENT_ACCUM_STEPS.
+GRADIENT_ACCUM_STEPS = 32  # Кол-во микро-батчей перед обновлением весов
                            # Эффективный батч = BATCH_SIZE × GRADIENT_ACCUM_STEPS × block_size
-                           # = 8 × 16 × 2048 = 262,144 токенов ≈ 0.26M
+                           # = 4 × 32 × 2048 = 262,144 токенов ≈ 0.26M (тот же effective batch)
 
 # --- Learning Rate ---
 LEARNING_RATE = 1e-4       # Пиковый LR (более стабильный для 1B, Llama-style)
