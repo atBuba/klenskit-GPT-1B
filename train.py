@@ -419,7 +419,18 @@ def train():
 
     # Gradient checkpointing — пересчитываем активации при backward вместо хранения
     # Экономит ~60% VRAM ценой ~30% скорости. Для 1B модели — рекомендуется.
-    config.use_gradient_checkpointing = True
+    #
+    # ⚠️  НЕСОВМЕСТИМО с Transformer Engine (FP8/FP4)!
+    # TE меняет количество сохранённых тензоров при recomputation (FP8 квантизация),
+    # что вызывает CheckpointError. При FP8 gradient checkpointing не нужен —
+    # FP8 сам по себе снижает потребление VRAM за счёт квантизации весов и активаций.
+    use_te_mode = PRECISION_MODE in ("fp8", "fp4") and TE_AVAILABLE and device.type == "cuda"
+    if use_te_mode:
+        config.use_gradient_checkpointing = False
+        print("📦 Gradient checkpointing: ВЫКЛ (несовместимо с Transformer Engine)")
+    else:
+        config.use_gradient_checkpointing = True
+        print("📦 Gradient checkpointing: ВКЛ (экономия ~60% VRAM)")
 
     train_dataset = MemmapDataset(str(train_bin), config.block_size)
     val_dataset = MemmapDataset(str(val_bin), config.block_size)
