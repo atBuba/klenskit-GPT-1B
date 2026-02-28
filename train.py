@@ -525,7 +525,29 @@ def train():
     running_loss = 0.0
     best_val_loss = float("inf")
 
+    # --- CUDA Warmup ---
+    # Первый forward pass на новом GPU (особенно Blackwell SM 12.0) запускает
+    # JIT-компиляцию CUDA ядер. Это может занять 1-3 минуты.
+    # Делаем warmup заранее чтобы не искажать таймеры обучения.
+    print("⏳ CUDA warmup (компиляция ядер для GPU)...")
+    warmup_start = time.time()
+    with torch.no_grad():
+        wx, wy = train_dataset.get_batch(BATCH_SIZE, device)
+        with amp_ctx:
+            if te_ctx_fn is not None:
+                with te_ctx_fn():
+                    _ = model(wx, wy)
+            else:
+                _ = model(wx, wy)
+        del wx, wy
+        torch.cuda.synchronize()
+    warmup_time = time.time() - warmup_start
+    print(f"✅ Warmup завершён за {warmup_time:.1f}s")
+    start_time = time.time()  # Сбрасываем таймер после warmup
+
     for step in range(start_step, MAX_STEPS):
+        step_start = time.time()
+
         # --- Learning Rate Schedule ---
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
@@ -552,8 +574,6 @@ def train():
                     logits, loss = model(x, y)
                 loss = loss / GRADIENT_ACCUM_STEPS  # нормализуем по кол-ву шагов
 
-            # backward — на Blackwell GDDR7 (1.79 TB/s) gradient sync быстрый,
-            # но всё равно лучше не создавать лишних аллокаций
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 
@@ -571,6 +591,11 @@ def train():
         scaler.update()
 
         running_loss += accum_loss
+
+        # --- Вывод первых шагов (чтобы видеть что обучение идёт) ---
+        if step < 5 or (step < 50 and step % 10 == 0):
+            step_time = time.time() - step_start
+            print(f"  Шаг {step} | Loss: {accum_loss:.4f} | Время: {step_time:.2f}s | LR: {lr:.2e}")
 
         # --- Логирование ---
         if step % LOG_INTERVAL == 0 and step > 0:
