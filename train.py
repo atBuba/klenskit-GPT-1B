@@ -103,9 +103,13 @@ WANDB_PROJECT = "klenskiy-gpt-1b"
 # "auto"  — автоматически определяет лучший режим по GPU (рекомендуется!)
 # "bf16"  — стандарт (работает везде: Ampere, Hopper, Blackwell, MPS)
 # "fp8"   — MXFP8 через Transformer Engine (Hopper H100+, Blackwell) — ~2x ускорение
-# "fp4"   — NVFP4 через Transformer Engine (Blackwell RTX 5090 / B200) — до ~3x ускорение
+# "fp4"   — NVFP4 через Transformer Engine (ТОЛЬКО серверные Blackwell B200/B100)
 #
-# Для RTX 5090 (Blackwell consumer): "fp4" если TE >= 2.7, иначе "fp8"
+# ⚠️  FP4 (NVFP4BlockScaling) НЕ работает на consumer Blackwell (RTX 5090) —
+#     Hadamard transform CUDA ядро несовместимо. Используй только на B200/B100.
+#
+# Для RTX 5090 (Blackwell consumer): "fp8" (auto определит)
+# Для B200/B100 (Blackwell datacenter): "fp4" (задать вручную!)
 # Для H100 (Hopper): "fp8"
 # Для RTX 4090 (Ada): "bf16"
 PRECISION_MODE = "auto"
@@ -115,11 +119,13 @@ def detect_precision_mode():
     """
     Автоматически определяет лучший precision mode по GPU.
 
-    Blackwell (SM 12.0 = major 12, RTX 5090 / B200): FP4 если TE поддерживает, иначе FP8
-    Hopper (SM 9.0 = major 9, H100): FP8
-    Ada Lovelace (SM 8.9 = major 8 minor 9, RTX 4090): bf16
+    Blackwell consumer (SM 12.0, RTX 5090): FP8 (FP4 NVFP4 не работает на consumer GPU)
+    Hopper (SM 9.0, H100): FP8
+    Ada Lovelace (SM 8.9, RTX 4090): bf16
     Ampere (SM 8.0-8.6, A100/RTX 3090): bf16
     Остальные: bf16
+
+    Для серверных Blackwell (B200/B100) задай PRECISION_MODE = "fp4" вручную.
     """
     if not torch.cuda.is_available() or not TE_AVAILABLE:
         return "bf16"
@@ -129,12 +135,13 @@ def detect_precision_mode():
 
     if major >= 12:
         # Blackwell (RTX 5090 = SM 12.0, B200 = SM 12.0)
-        if hasattr(te_recipe, 'NVFP4BlockScaling'):
-            print(f"🔍 GPU SM {major}.{minor} (Blackwell) + TE с NVFP4 → режим FP4")
-            return "fp4"
-        else:
-            print(f"🔍 GPU SM {major}.{minor} (Blackwell) но TE без NVFP4 → режим FP8")
-            return "fp8"
+        # FP4 (NVFP4BlockScaling) вызывает ошибку на consumer RTX 5090:
+        #   "CUDA Error: invalid argument" в hadamard_transform_cast_fusion.cu
+        # Поэтому auto всегда выбирает FP8 для Blackwell.
+        # Для серверных B200/B100 можно задать PRECISION_MODE = "fp4" вручную.
+        print(f"🔍 GPU SM {major}.{minor} (Blackwell) → режим FP8")
+        print(f"   (FP4 доступен только на серверных B200/B100, для RTX 5090 используем FP8)")
+        return "fp8"
     elif major >= 9:
         # Hopper (H100 = SM 9.0) — FP8 нативно поддерживается
         print(f"🔍 GPU SM {major}.{minor} (Hopper) → режим FP8")
